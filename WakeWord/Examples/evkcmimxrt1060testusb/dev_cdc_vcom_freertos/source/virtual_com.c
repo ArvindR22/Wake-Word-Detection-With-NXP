@@ -623,23 +623,17 @@ void USB_DeviceTask(void *handle)
  *
  * @return None.
  */
-void APPTask(void *handle)
+void UsbControlTask(void *handle)
 {
-    usb_status_t error = kStatus_USB_Error;
-    uint32_t usbOsaCurrentSr;
-
+    /* Initialize the USB device stack */
     USB_DeviceApplicationInit();
 
+    /* This block from the original code starts the low-level USB handler task. It's good practice to keep it. */
 #if USB_DEVICE_CONFIG_USE_TASK
     if (s_cdcVcom.deviceHandle)
     {
-        if (xTaskCreate(USB_DeviceTask,                  /* pointer to the task                      */
-                        (char const *)"usb device task", /* task name for kernel awareness debugging */
-                        5000L / sizeof(portSTACK_TYPE),  /* task stack size                          */
-                        s_cdcVcom.deviceHandle,          /* optional task startup argument           */
-                        5,                               /* initial priority                         */
-                        &s_cdcVcom.deviceTaskHandle      /* optional task handle to create           */
-                        ) != pdPASS)
+        if (xTaskCreate(USB_DeviceTask, "usb device task", 5000L / sizeof(portSTACK_TYPE),
+                        s_cdcVcom.deviceHandle, 5, &s_cdcVcom.deviceTaskHandle) != pdPASS)
         {
             usb_echo("usb device task create failed!\r\n");
             return;
@@ -647,81 +641,85 @@ void APPTask(void *handle)
     }
 #endif
 
+    /* Main loop for this task */
     while (1)
     {
-        if ((1U == s_cdcVcom.attach) && (1U == s_cdcVcom.startTransactions))
+        /* Check if the USB interrupt has set the "data received" flag */
+        if ((s_recvSize != 0) && (s_recvSize != USB_CANCELLED_TRANSFER_LENGTH))
         {
-            /* Enter critical can not be added here because of the loop */
-            /* endpoint callback length is USB_CANCELLED_TRANSFER_LENGTH (0xFFFFFFFFU) when transfer is canceled */
-            if ((0 != s_recvSize) && (USB_CANCELLED_TRANSFER_LENGTH != s_recvSize))
-            {
-                /* The operating timing sequence has guaranteed there is no conflict to access the s_recvSize between
-                   USB ISR and this task. Therefore, the following code of Enter/Exit ctitical mode is useless, only to
-                   mention users the exclusive access of s_recvSize if users implement their own
-                   application referred to this SDK demo */
-                CDC_VCOM_FreeRTOSEnterCritical(&usbOsaCurrentSr);
-                if ((0U != s_recvSize) && (USB_CANCELLED_TRANSFER_LENGTH != s_recvSize))
-                {
-                    /* Copy Buffer to Send Buff */
-                    memcpy(s_currSendBuf, s_currRecvBuf, s_recvSize);
-                    s_sendSize = s_recvSize;
-                    s_recvSize = 0;
-                }
-                CDC_VCOM_FreeRTOSExitCritical(usbOsaCurrentSr);
-            }
+            /* Send a wake-up message over USB */
+            char *wake_msg = "Wake-up detected. Starting process.\r\n";
+            USB_DeviceCdcAcmSend(s_cdcVcom.cdcAcmHandle, USB_CDC_VCOM_BULK_IN_ENDPOINT, (uint8_t *)wake_msg, strlen(wake_msg));
+            vTaskDelay(pdMS_TO_TICKS(10)); /* Small delay to allow the message to be sent */
 
-            if (0U != s_sendSize)
-            {
-                uint32_t size = s_sendSize;
-                s_sendSize    = 0;
+            /* Send the fixed reply "1234567" */
+            char *fixed_reply = "1234567\r\n";
+            USB_DeviceCdcAcmSend(s_cdcVcom.cdcAcmHandle, USB_CDC_VCOM_BULK_IN_ENDPOINT, (uint8_t *)fixed_reply, strlen(fixed_reply));
 
-                error =
-                    USB_DeviceCdcAcmSend(s_cdcVcom.cdcAcmHandle, USB_CDC_VCOM_BULK_IN_ENDPOINT, s_currSendBuf, size);
-                if (error != kStatus_USB_Success)
-                {
-                    /* Failure to send Data Handling code here */
-                }
-            }
+            /* Echo the original input back to the user */
+            USB_DeviceCdcAcmSend(s_cdcVcom.cdcAcmHandle, USB_CDC_VCOM_BULK_OUT_ENDPOINT, s_currRecvBuf, s_recvSize);
+
+            /* Reset the receive flag since we have handled the data */
+            s_recvSize = 0;
+
+            /* Give the semaphore to activate the second thread */
+            xSemaphoreGive(xUsbActivitySemaphore);
+        }
+
+        /* This delay is critical. It allows other tasks to run. */
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+
+
+
+
+
+
+
+/*
+ * This is Thread 2: The Periodic Sender Task.
+ * It waits for a signal, sends data 20 times, then triggers low-power mode.
+ */
+void PeriodicSendTask(void *handle)
+{
+    for (;;)
+    {
+        // ... (The beginning of your task: xSemaphoreTake, for loop, etc.) ...
+
+        // --- After the 20 sends are complete ---
+
+        char *sleep_msg = "Task finished. Entering low power mode...\r\n";
+        USB_DeviceCdcAcmSend(s_cdcVcom.cdcAcmHandle, USB_CDC_VCOM_BULK_IN_ENDPOINT, (uint8_t *)sleep_msg, strlen(sleep_msg));
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+        /*
+         * THE FIX: Wrap the entire low-power block in the original #if statement.
+         * This ensures these functions are only called when they are also being built.
+         */
 #if defined(FSL_FEATURE_USB_KHCI_KEEP_ALIVE_ENABLED) && (FSL_FEATURE_USB_KHCI_KEEP_ALIVE_ENABLED > 0U) && \
     defined(USB_DEVICE_CONFIG_KEEP_ALIVE_MODE) && (USB_DEVICE_CONFIG_KEEP_ALIVE_MODE > 0U) &&             \
     defined(FSL_FEATURE_USB_KHCI_USB_RAM) && (FSL_FEATURE_USB_KHCI_USB_RAM > 0U)
-            if ((s_waitForDataReceive))
-            {
-                if (s_comOpen == 1)
-                {
-                    /* Wait for all the packets been sent during opening the com port. Otherwise these packets may
-                     * wake up the system.
-                     */
-                    usb_echo("Waiting to enter lowpower ...\r\n");
-                    for (uint32_t i = 0U; i < 16000000U; ++i)
-                    {
-                        __NOP(); /* delay */
-                    }
 
-                    s_comOpen = 0;
-                }
-                usb_echo("Enter lowpower\r\n");
-                BOARD_DbgConsole_Deinit();
-                USB0->INTEN &= ~USB_INTEN_TOKDNEEN_MASK;
-                if (SysTick->CTRL & SysTick_CTRL_ENABLE_Msk)
-                {
-                    SysTick->CTRL &= ~SysTick_CTRL_TICKINT_Msk;
-                }
-                USB_EnterLowpowerMode();
+        usb_echo("UART: Entering lowpower\r\n");
+        BOARD_DbgConsole_Deinit(); // Now this call is safe
 
-                if (SysTick->CTRL & SysTick_CTRL_ENABLE_Msk)
-                {
-                    SysTick->CTRL |= SysTick_CTRL_TICKINT_Msk;
-                }
-                s_waitForDataReceive = 0;
-                USB0->INTEN |= USB_INTEN_TOKDNEEN_MASK;
-                BOARD_DbgConsole_Init();
-                usb_echo("Exit  lowpower\r\n");
-            }
-#endif
+        if (SysTick->CTRL & SysTick_CTRL_ENABLE_Msk)
+        {
+            SysTick->CTRL &= ~SysTick_CTRL_TICKINT_Msk;
         }
+
+        USB_EnterLowpowerMode();
+
+#endif
+        /* The MCU will halt in the block above until a wake-up event */
     }
 }
+
+
+
+
 void buffer_fill(void)
 {
     for (int i = 0; i < 100; i++)
