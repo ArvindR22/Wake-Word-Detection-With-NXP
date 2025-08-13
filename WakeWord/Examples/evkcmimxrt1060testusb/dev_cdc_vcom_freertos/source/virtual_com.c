@@ -84,6 +84,9 @@ static uint8_t s_lineCoding[LINE_CODING_SIZE] = {
     LINE_CODING_PARITYTYPE,
     LINE_CODING_DATABITS};
 
+uint8_t SendInvitation[100];// Our Global Variable for sending data ARV
+
+
 /* Abstract state of cdc device */
 USB_DMA_INIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE)
 static uint8_t s_abstractState[COMM_FEATURE_DATA_SIZE] = {(STATUS_ABSTRACT_STATE >> 0U) & 0x00FFU,
