@@ -85,6 +85,9 @@ static uint8_t s_lineCoding[LINE_CODING_SIZE] = {
     LINE_CODING_DATABITS};
 
 uint8_t SendInvitation[100];// Our Global Variable for sending data ARV
+#include "semphr.h" // Needed for semaphores
+SemaphoreHandle_t xUsbActivitySemaphore = NULL;
+
 
 
 /* Abstract state of cdc device */
@@ -719,6 +722,19 @@ void APPTask(void *handle)
         }
     }
 }
+void buffer_fill(void)
+{
+    for (int i = 0; i < 100; i++)
+    {
+        SendInvitation[i] = 100 + i;
+    }
+}
+
+
+
+
+
+
 
 #if defined(__CC_ARM) || (defined(__ARMCC_VERSION)) || defined(__GNUC__)
 int main(void)
@@ -726,17 +742,17 @@ int main(void)
 void main(void)
 #endif
 {
+    /* 1. Standard hardware and board initialization */
     BOARD_InitHardware();
 
-    if (xTaskCreate(APPTask,                                      /* pointer to the task                      */
-                    s_appName,                                    /* task name for kernel awareness debugging */
-                    APP_TASK_STACK_SIZE / sizeof(portSTACK_TYPE), /* task stack size                          */
-                    &s_cdcVcom,                                   /* optional task startup argument           */
-                    4,                                            /* initial priority                         */
-                    &s_cdcVcom.applicationTaskHandle              /* optional task handle to create           */
-                    ) != pdPASS)
+    /* 2. Call your function to pre-fill the global array */
+    buffer_fill();
+
+    /* 3. Create the binary semaphore to signal between tasks */
+    xUsbActivitySemaphore = xSemaphoreCreateBinary();
+    if (xUsbActivitySemaphore == NULL)
     {
-        usb_echo("app task create failed!\r\n");
+        usb_echo("Semaphore create failed!\r\n");
 #if (defined(__CC_ARM) || (defined(__ARMCC_VERSION)) || defined(__GNUC__))
         return 1;
 #else
@@ -744,6 +760,42 @@ void main(void)
 #endif
     }
 
+    /* 4. Create Thread 1: The task that controls and replies to USB input */
+    if (xTaskCreate(UsbControlTask,                               /* Pointer to the task's function */
+                    "UsbControlTask",                             /* Name of the task for debugging */
+                    APP_TASK_STACK_SIZE / sizeof(portSTACK_TYPE), /* Stack size */
+                    &s_cdcVcom,                                   /* Optional task startup argument */
+                    4,                                            /* Task priority (higher) */
+                    &s_cdcVcom.applicationTaskHandle              /* Optional task handle */
+                    ) != pdPASS)
+    {
+        usb_echo("UsbControlTask create failed!\r\n");
+#if (defined(__CC_ARM) || (defined(__ARMCC_VERSION)) || defined(__GNUC__))
+        return 1;
+#else
+        return;
+#endif
+    }
+
+    /* 5. Create Thread 2: The task that periodically sends the array */
+    if (xTaskCreate(PeriodicSendTask,                             /* Pointer to the task's function */
+                    "PeriodicSendTask",                           /* Name of the task for debugging */
+                    1024L / sizeof(portSTACK_TYPE),               /* Stack size (can be smaller) */
+                    NULL,                                         /* No startup argument needed */
+                    3,                                            /* Task priority (lower) */
+                    NULL                                          /* No task handle needed */
+                    ) != pdPASS)
+    {
+        usb_echo("PeriodicSendTask create failed!\r\n");
+#if (defined(__CC_ARM) || (defined(__ARMCC_VERSION)) || defined(__GNUC__))
+        return 1;
+#else
+        return;
+#endif
+    }
+
+
+    /* 6. Start the RTOS scheduler. This function never returns. */
     vTaskStartScheduler();
 
 #if (defined(__CC_ARM) || (defined(__ARMCC_VERSION)) || defined(__GNUC__))
