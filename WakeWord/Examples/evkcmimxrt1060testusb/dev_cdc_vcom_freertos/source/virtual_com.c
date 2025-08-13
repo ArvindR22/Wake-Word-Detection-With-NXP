@@ -623,6 +623,10 @@ void USB_DeviceTask(void *handle)
  *
  * @return None.
  */
+/*
+ * This is Thread 1: The USB Control Task.
+ * It waits for USB input, sends replies, and signals Thread 2 to start.
+ */
 void UsbControlTask(void *handle)
 {
     /* Initialize the USB device stack */
@@ -656,8 +660,28 @@ void UsbControlTask(void *handle)
             char *fixed_reply = "1234567\r\n";
             USB_DeviceCdcAcmSend(s_cdcVcom.cdcAcmHandle, USB_CDC_VCOM_BULK_IN_ENDPOINT, (uint8_t *)fixed_reply, strlen(fixed_reply));
 
-            /* Echo the original input back to the user */
-            USB_DeviceCdcAcmSend(s_cdcVcom.cdcAcmHandle, USB_CDC_VCOM_BULK_OUT_ENDPOINT, s_currRecvBuf, s_recvSize);
+            /* --- NEW: Convert and Echo Received Numbers as ASCII Text --- */
+
+            // Send a header for the echoed data
+            char *echo_header = "Echoing numbers as ASCII: ";
+            USB_DeviceCdcAcmSend(s_cdcVcom.cdcAcmHandle, USB_CDC_VCOM_BULK_IN_ENDPOINT, (uint8_t *)echo_header, strlen(echo_header));
+            vTaskDelay(pdMS_TO_TICKS(5));
+
+            // Loop through each byte that was received
+            for (int i = 0; i < s_recvSize; i++)
+            {
+                char ascii_buffer[10]; // Buffer to hold one converted number string
+
+                // Convert one byte (e.g., value 65) to a string (e.g., "65 ")
+                int len = sprintf(ascii_buffer, "%d ", s_currRecvBuf[i]);
+
+                // Send the resulting string over USB
+                USB_DeviceCdcAcmSend(s_cdcVcom.cdcAcmHandle, USB_CDC_VCOM_BULK_IN_ENDPOINT, (uint8_t *)ascii_buffer, len);
+                vTaskDelay(pdMS_TO_TICKS(5)); // small delay between numbers
+            }
+
+            // Send a newline character to finish the line
+            USB_DeviceCdcAcmSend(s_cdcVcom.cdcAcmHandle, USB_CDC_VCOM_BULK_IN_ENDPOINT, (uint8_t *)"\r\n", 2);
 
             /* Reset the receive flag since we have handled the data */
             s_recvSize = 0;
@@ -682,28 +706,46 @@ void UsbControlTask(void *handle)
  * This is Thread 2: The Periodic Sender Task.
  * It waits for a signal, sends data 20 times, then triggers low-power mode.
  */
+/*
+ * This is Thread 2: The Periodic Sender Task.
+ * It waits for a signal, sends data 20 times, then triggers low-power mode.
+ */
 void PeriodicSendTask(void *handle)
 {
+    /* The outer loop makes the task restart its logic after waking from sleep */
     for (;;)
     {
-        // ... (The beginning of your task: xSemaphoreTake, for loop, etc.) ...
+        /* Wait here indefinitely until UsbControlTask gives the semaphore.
+           This uses 0% CPU while waiting. */
+        xSemaphoreTake(xUsbActivitySemaphore, portMAX_DELAY);
 
-        // --- After the 20 sends are complete ---
+        /* This check is still good to have before starting the whole process */
+        if ((1U == s_cdcVcom.attach) && (1U == s_cdcVcom.startTransactions))
+        {
+            /* Run the send loop exactly 20 times */
+            for (int i = 0; i < 20; i++)
+            {
+                /* The internal IF check was removed to ensure this always sends */
+                USB_DeviceCdcAcmSend(s_cdcVcom.cdcAcmHandle, USB_CDC_VCOM_BULK_IN_ENDPOINT, SendInvitation, 100);
+
+                /* Wait for 1 second before the next send */
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+        }
+
+        /* The 20 sends are complete. Now, prepare for low-power mode. */
 
         char *sleep_msg = "Task finished. Entering low power mode...\r\n";
         USB_DeviceCdcAcmSend(s_cdcVcom.cdcAcmHandle, USB_CDC_VCOM_BULK_IN_ENDPOINT, (uint8_t *)sleep_msg, strlen(sleep_msg));
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(100)); /* Give time for the message to be sent */
 
-        /*
-         * THE FIX: Wrap the entire low-power block in the original #if statement.
-         * This ensures these functions are only called when they are also being built.
-         */
+        /* The low-power entry logic, wrapped in its original preprocessor guard */
 #if defined(FSL_FEATURE_USB_KHCI_KEEP_ALIVE_ENABLED) && (FSL_FEATURE_USB_KHCI_KEEP_ALIVE_ENABLED > 0U) && \
     defined(USB_DEVICE_CONFIG_KEEP_ALIVE_MODE) && (USB_DEVICE_CONFIG_KEEP_ALIVE_MODE > 0U) &&             \
     defined(FSL_FEATURE_USB_KHCI_USB_RAM) && (FSL_FEATURE_USB_KHCI_USB_RAM > 0U)
 
         usb_echo("UART: Entering lowpower\r\n");
-        BOARD_DbgConsole_Deinit(); // Now this call is safe
+        BOARD_DbgConsole_Deinit();
 
         if (SysTick->CTRL & SysTick_CTRL_ENABLE_Msk)
         {
@@ -716,8 +758,6 @@ void PeriodicSendTask(void *handle)
         /* The MCU will halt in the block above until a wake-up event */
     }
 }
-
-
 
 
 void buffer_fill(void)
